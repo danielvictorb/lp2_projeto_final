@@ -169,44 +169,99 @@ static void update_stats(const char *sensor_name, uint32_t seq, double value)
 
 static void print_stats(void)
 {
-    printf("\n===== Sensor Statistics =====\n");
+    printf("\n=== Estatisticas Locais ===\n");
     int any = 0;
     for (int i = 0; i < NUM_SENSORS; i++) {
         if (!stats[i].tracked) continue;
         any = 1;
         sensor_stats_t *s = &stats[i];
         double avg = (s->received > 0) ? s->sum_val / s->received : 0.0;
-        printf("  [%s]\n", s->name);
-        printf("    Received : %u\n", s->received);
-        printf("    Lost     : %u\n", s->lost);
-        printf("    Min      : %.2f\n", s->min_val);
-        printf("    Max      : %.2f\n", s->max_val);
-        printf("    Average  : %.2f\n", avg);
+        double pct = (s->received + s->lost > 0)
+            ? 100.0 * s->lost / (s->received + s->lost) : 0.0;
+        printf("%-12s recebidos=%u, perdidos=%u (%.1f%%), "
+               "min=%.2f, max=%.2f, media=%.2f\n",
+               s->name, s->received, s->lost, pct,
+               s->min_val, s->max_val, avg);
     }
     if (!any) {
-        printf("  No sensor data received yet.\n");
+        printf("  Nenhum dado de sensor recebido ainda.\n");
     }
-    printf("=============================\n\n");
+    printf("\n");
+}
+
+/* ------------------------------------------------------------------ */
+/*  TCP response display                                               */
+/* ------------------------------------------------------------------ */
+
+static int is_known_header(const char *line)
+{
+    return strncmp(line, "Sensor:", 7) == 0 ||
+           strncmp(line, "Status:", 7) == 0 ||
+           strncmp(line, "UdpTarget:", 10) == 0 ||
+           strncmp(line, "Interval:", 9) == 0 ||
+           strncmp(line, "Count:", 6) == 0 ||
+           strncmp(line, "Error:", 6) == 0 ||
+           strncmp(line, "Seq:", 4) == 0 ||
+           strncmp(line, "Value:", 6) == 0;
+}
+
+static void display_response(const char *raw)
+{
+    char copy[BUF_SIZE * 2];
+    strncpy(copy, raw, sizeof(copy) - 1);
+    copy[sizeof(copy) - 1] = '\0';
+
+    char *term = strstr(copy, "\r\n\r\n");
+    if (term) *term = '\0';
+
+    char *lines[64];
+    int nlines = 0;
+    char *p = copy;
+    while (*p && nlines < 64) {
+        lines[nlines++] = p;
+        char *nl = strstr(p, "\r\n");
+        if (nl) {
+            *nl = '\0';
+            p = nl + 2;
+        } else {
+            break;
+        }
+    }
+
+    if (nlines == 0) return;
+
+    printf("Resposta: %s", lines[0]);
+
+    int header_end = 1;
+    for (int i = 1; i < nlines; i++) {
+        if (is_known_header(lines[i])) {
+            printf(" | %s", lines[i]);
+            header_end = i + 1;
+        } else {
+            break;
+        }
+    }
+    printf("\n");
+
+    for (int i = header_end; i < nlines; i++) {
+        if (lines[i][0] != '\0')
+            printf("  %s\n", lines[i]);
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /*  CLI command translation                                            */
 /* ------------------------------------------------------------------ */
 
-/*
- * Build a protocol-level TCP request from a user-typed CLI line.
- * Returns the number of bytes written to `out`, or 0 if the line
- * is a local-only command (stats, quit) handled in-place, or -1
- * for an unrecognised command.
- *
- * Supported interactive commands:
- *   start <sensor> [udp_port]
- *   stop <sensor>
- *   status
- *   status <sensor>
- *   exit | quit
- *   stats
- */
+static const char *strip_sensor_prefix(const char *arg)
+{
+    if (strncmp(arg, "/sensor/", 8) == 0)
+        return arg + 8;
+    if (strncmp(arg, "/sensors", 8) == 0)
+        return NULL;
+    return arg;
+}
+
 static int build_request(const char *line, char *out, size_t out_size,
                          int udp_port, int *do_quit)
 {
@@ -217,26 +272,24 @@ static int build_request(const char *line, char *out, size_t out_size,
     int nargs = sscanf(line, "%31s %63s %15s", cmd, arg, arg2);
     if (nargs < 1) return -1;
 
-    /* Local-only commands */
     if (strcasecmp(cmd, "stats") == 0) {
         print_stats();
         return 0;
     }
-    if (strcasecmp(cmd, "quit") == 0) {
-        int n = snprintf(out, out_size, "EXIT /" CRLF CRLF);
-        *do_quit = 1;
-        return n;
-    }
-    if (strcasecmp(cmd, "exit") == 0) {
+    if (strcasecmp(cmd, "quit") == 0 || strcasecmp(cmd, "exit") == 0) {
         int n = snprintf(out, out_size, "EXIT /" CRLF CRLF);
         *do_quit = 1;
         return n;
     }
 
-    /* Protocol commands */
     if (strcasecmp(cmd, "start") == 0) {
         if (nargs < 2) {
-            printf("Usage: start <sensor> [udp_port]\n");
+            printf("Uso: start <sensor> [porta_udp]\n");
+            return 0;
+        }
+        const char *sensor_name = strip_sensor_prefix(arg);
+        if (!sensor_name) {
+            printf("Uso: start <sensor> [porta_udp]\n");
             return 0;
         }
         int port = udp_port;
@@ -246,29 +299,41 @@ static int build_request(const char *line, char *out, size_t out_size,
                          "START /sensor/%s" CRLF
                          "UdpPort: %d" CRLF
                          CRLF,
-                         arg, port);
+                         sensor_name, port);
         return n;
     }
 
     if (strcasecmp(cmd, "stop") == 0) {
         if (nargs < 2) {
-            printf("Usage: stop <sensor>\n");
+            printf("Uso: stop <sensor>\n");
+            return 0;
+        }
+        const char *sensor_name = strip_sensor_prefix(arg);
+        if (!sensor_name) {
+            printf("Uso: stop <sensor>\n");
             return 0;
         }
         int n = snprintf(out, out_size,
                          "STOP /sensor/%s" CRLF
                          CRLF,
-                         arg);
+                         sensor_name);
         return n;
     }
 
     if (strcasecmp(cmd, "status") == 0) {
         int n;
         if (nargs >= 2) {
-            n = snprintf(out, out_size,
-                         "STATUS /sensor/%s" CRLF
-                         CRLF,
-                         arg);
+            const char *sensor_name = strip_sensor_prefix(arg);
+            if (!sensor_name || strcmp(arg, "/sensors") == 0) {
+                n = snprintf(out, out_size,
+                             "STATUS /sensors" CRLF
+                             CRLF);
+            } else {
+                n = snprintf(out, out_size,
+                             "STATUS /sensor/%s" CRLF
+                             CRLF,
+                             sensor_name);
+            }
         } else {
             n = snprintf(out, out_size,
                          "STATUS /sensors" CRLF
@@ -277,8 +342,8 @@ static int build_request(const char *line, char *out, size_t out_size,
         return n;
     }
 
-    printf("Unknown command: %s\n", cmd);
-    printf("Commands: start <sensor> | stop <sensor> | status [sensor] | stats | quit\n");
+    printf("Comando desconhecido: %s\n", cmd);
+    printf("Comandos: start <sensor>, stop <sensor>, status [sensor], stats, quit\n");
     return 0;
 }
 
@@ -322,7 +387,7 @@ int main(int argc, char *argv[])
         close(tcp_fd);
         exit(EXIT_FAILURE);
     }
-    printf("Connected to server %s:%d (TCP)\n", server_host, tcp_port);
+    printf("Conectado ao servidor %s:%d\n", server_host, tcp_port);
 
     /* ---- UDP receive socket ---- */
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -340,8 +405,8 @@ int main(int argc, char *argv[])
         close(udp_fd);
         exit(EXIT_FAILURE);
     }
-    printf("Listening for sensor data on UDP port %d\n", udp_port);
-    printf("Type 'help' for available commands.\n\n");
+    printf("Socket UDP escutando na porta %d\n", udp_port);
+    printf("Digite comandos (START, STOP, STATUS, stats, quit):\n\n");
 
     /* ---- TCP receive buffer for partial reads ---- */
     char tcp_buf[BUF_SIZE * 2];
@@ -383,14 +448,13 @@ int main(int argc, char *argv[])
             line[strcspn(line, "\n")] = '\0';
             if (line[0] == '\0') continue;
 
-            /* Handle "help" locally */
             if (strcasecmp(line, "help") == 0) {
-                printf("Commands:\n");
-                printf("  start <sensor> [udp_port]  — start streaming (temperatura, umidade, pressao)\n");
-                printf("  stop <sensor>              — stop streaming\n");
-                printf("  status [sensor]            — query sensor status\n");
-                printf("  stats                      — show local statistics\n");
-                printf("  quit / exit                — disconnect and exit\n\n");
+                printf("Comandos disponiveis:\n");
+                printf("  start <sensor> [porta_udp] — inicia streaming (temperatura, umidade, pressao)\n");
+                printf("  stop <sensor>              — para o streaming\n");
+                printf("  status [sensor]            — consulta estado dos sensores\n");
+                printf("  stats                      — exibe estatisticas locais\n");
+                printf("  quit                       — envia EXIT e encerra\n\n");
                 continue;
             }
 
@@ -407,20 +471,17 @@ int main(int argc, char *argv[])
                 }
             }
             if (do_quit) {
-                /*
-                 * Give the server a moment to process EXIT and send its
-                 * response before we start reading it.
-                 */
+                printf("Enviando EXIT ao servidor...\n");
                 usleep(200000);
 
-                /* Drain any pending TCP response */
                 char tmp[BUF_SIZE];
                 ssize_t nr = recv(tcp_fd, tmp, sizeof(tmp) - 1, MSG_DONTWAIT);
                 if (nr > 0) {
                     tmp[nr] = '\0';
-                    printf("\n--- Server Response ---\n%s---\n", tmp);
+                    display_response(tmp);
                 }
 
+                printf("Conexao encerrada.\n");
                 running = 0;
                 break;
             }
@@ -432,7 +493,7 @@ int main(int argc, char *argv[])
                              sizeof(tcp_buf) - (size_t)tcp_buf_len - 1, 0);
             if (n <= 0) {
                 if (n == 0)
-                    printf("Server closed the connection.\n");
+                    printf("Servidor fechou a conexao.\n");
                 else
                     perror("recv TCP");
                 running = 0;
@@ -441,17 +502,13 @@ int main(int argc, char *argv[])
             tcp_buf_len += (int)n;
             tcp_buf[tcp_buf_len] = '\0';
 
-            /*
-             * Print each complete response (terminated by CRLF CRLF).
-             * We keep any partial trailing data in the buffer.
-             */
             char *end;
             while ((end = strstr(tcp_buf, MSG_END)) != NULL) {
                 int msg_len = (int)(end - tcp_buf) + 4;
                 char saved  = tcp_buf[msg_len];
                 tcp_buf[msg_len] = '\0';
 
-                printf("\n--- Server Response ---\n%s---\n", tcp_buf);
+                display_response(tcp_buf);
 
                 tcp_buf[msg_len] = saved;
                 tcp_buf_len -= msg_len;
@@ -478,11 +535,11 @@ int main(int argc, char *argv[])
                 if (parse_datagram(dgram, &seq, sensor, sizeof(sensor),
                                    &value, unit, sizeof(unit),
                                    ts, sizeof(ts)) == 0) {
-                    printf("[UDP] SEQ:%u  %-12s  %.2f %s  (ts %s)\n",
+                    printf("[UDP] SEQ:%-4u | %-12s | %.2f %-3s | TS:%s\n",
                            seq, sensor, value, unit, ts);
                     update_stats(sensor, seq, value);
                 } else {
-                    printf("[UDP] malformed datagram: %s\n", dgram);
+                    printf("[UDP] datagrama malformado: %s\n", dgram);
                 }
             }
         }
@@ -490,6 +547,6 @@ int main(int argc, char *argv[])
 
     close(tcp_fd);
     close(udp_fd);
-    printf("Client terminated.\n");
+    printf("Cliente encerrado.\n");
     return 0;
 }

@@ -1,0 +1,14 @@
+*.exe
+*.o
+sensor_server
+sensor_client
+*.dSYM
+*.swp
+*.swo
+*.swm
+*.swl
+*.swp
+*.swq
+*.swr
+*.sws
+*.swt

@@ -80,41 +80,26 @@ static void server_log(const char *fmt, ...)
 }
 
 /* ------------------------------------------------------------------ */
-/*  TCP response formatting                                            */
+/*  TCP response helpers                                               */
 /* ------------------------------------------------------------------ */
 
-/*
- * Send a complete protocol response over the TCP control socket.
- * The format mirrors the request style: status line, optional body,
- * terminated by \r\n\r\n.
- */
-static void send_response(int tcp_fd, int code, const char *reason,
-                           const char *body)
+static void send_tcp(int tcp_fd, const char *msg, size_t len)
+{
+    ssize_t sent = send(tcp_fd, msg, len, 0);
+    if (sent < 0)
+        perror("send response");
+}
+
+static void send_error(int tcp_fd, int code, const char *reason,
+                       const char *detail)
 {
     char buf[BUF_SIZE];
-    int  n;
-
-    if (body && body[0] != '\0') {
-        n = snprintf(buf, sizeof(buf),
+    int n = snprintf(buf, sizeof(buf),
                      "%d %s" CRLF
-                     "Content-Length: %zu" CRLF
-                     CRLF
-                     "%s" CRLF,
-                     code, reason,
-                     strlen(body),
-                     body);
-    } else {
-        n = snprintf(buf, sizeof(buf),
-                     "%d %s" CRLF
+                     "Error: %s" CRLF
                      CRLF,
-                     code, reason);
-    }
-
-    if (n > 0) {
-        ssize_t sent = send(tcp_fd, buf, (size_t)n, 0);
-        if (sent < 0)
-            perror("send response");
-    }
+                     code, reason, detail);
+    if (n > 0) send_tcp(tcp_fd, buf, (size_t)n);
 }
 
 /* ------------------------------------------------------------------ */
@@ -148,10 +133,10 @@ static void *sensor_thread_fn(void *arg)
      */
     double max_delta = (def->max_val - def->min_val) * 0.01;
 
-    server_log("Sensor '%s' thread started (interval %d ms, UDP -> %s:%d)",
+    server_log("Fluxo %s INICIADO (intervalo: %dms, UDP -> %s:%d)",
                def->name, def->interval_ms,
                inet_ntoa(st->udp_dest.sin_addr),
-               ntohs(st->udp_dest.sin_port));
+               (int)ntohs(st->udp_dest.sin_port));
 
     while (st->active) {
         st->current_value = random_walk(st->current_value,
@@ -179,7 +164,7 @@ static void *sensor_thread_fn(void *arg)
         usleep(interval_us);
     }
 
-    server_log("Sensor '%s' thread stopped (seq reached %u)",
+    server_log("Fluxo %s PARADO (total enviados: %u pacotes)",
                def->name, st->seq);
     return NULL;
 }
@@ -231,36 +216,38 @@ static void handle_start(int tcp_fd, const char *resource,
 {
     int idx = parse_sensor_resource(resource);
     if (idx < 0) {
-        send_response(tcp_fd, STATUS_NOT_FOUND, "Not Found",
-                      "Unknown sensor.");
+        char detail[128];
+        snprintf(detail, sizeof(detail),
+                 "sensor '%s' nao existe", resource + 8);
+        send_error(tcp_fd, STATUS_NOT_FOUND, "Not Found", detail);
         server_log("START rejected: unknown resource '%s'", resource);
         return;
     }
 
     if (sensors[idx].active) {
-        send_response(tcp_fd, STATUS_CONFLICT, "Conflict",
-                      "Sensor already active.");
+        char detail[128];
+        snprintf(detail, sizeof(detail),
+                 "sensor '%s' ja esta ativo", SENSOR_CATALOGUE[idx].name);
+        send_error(tcp_fd, STATUS_CONFLICT, "Conflict", detail);
         server_log("START rejected: '%s' already active",
                    SENSOR_CATALOGUE[idx].name);
         return;
     }
 
-    /* UdpPort header is mandatory for START */
     char port_str[16];
     if (extract_header(raw_request, "UdpPort", port_str, sizeof(port_str)) != 0) {
-        send_response(tcp_fd, STATUS_BAD_REQUEST, "Bad Request",
-                      "Missing UdpPort header.");
+        send_error(tcp_fd, STATUS_BAD_REQUEST, "Bad Request",
+                   "header UdpPort ausente");
         server_log("START rejected: missing UdpPort header");
         return;
     }
     int udp_port = atoi(port_str);
     if (udp_port <= 0 || udp_port > 65535) {
-        send_response(tcp_fd, STATUS_BAD_REQUEST, "Bad Request",
-                      "Invalid UdpPort value.");
+        send_error(tcp_fd, STATUS_BAD_REQUEST, "Bad Request",
+                   "valor UdpPort invalido");
         return;
     }
 
-    /* Set up the sensor state and launch its thread */
     sensors[idx].sensor_idx = idx;
     sensors[idx].seq        = 0;
     sensors[idx].udp_fd     = udp_fd;
@@ -276,108 +263,135 @@ static void handle_start(int tcp_fd, const char *resource,
     if (pthread_create(&sensors[idx].thread, NULL,
                        sensor_thread_fn, &sensors[idx]) != 0) {
         sensors[idx].active = 0;
-        send_response(tcp_fd, STATUS_BAD_REQUEST, "Bad Request",
-                      "Failed to create sensor thread.");
+        send_error(tcp_fd, STATUS_BAD_REQUEST, "Bad Request",
+                   "falha ao criar thread do sensor");
         server_log("pthread_create failed for '%s'",
                    SENSOR_CATALOGUE[idx].name);
         return;
     }
-    /* Detach so we don't have to join on normal stop */
     pthread_detach(sensors[idx].thread);
 
-    server_log("START '%s' -> UDP %s:%d",
-               SENSOR_CATALOGUE[idx].name,
-               inet_ntoa(client_addr->sin_addr), udp_port);
-
-    char body[128];
-    snprintf(body, sizeof(body), "Sensor '%s' started.",
-             SENSOR_CATALOGUE[idx].name);
-    send_response(tcp_fd, STATUS_OK, "OK", body);
+    char resp[BUF_SIZE];
+    int n = snprintf(resp, sizeof(resp),
+                     "200 OK" CRLF
+                     "Sensor: %s" CRLF
+                     "Status: streaming" CRLF
+                     "UdpTarget: %s:%d" CRLF
+                     "Interval: %dms" CRLF
+                     CRLF,
+                     SENSOR_CATALOGUE[idx].name,
+                     inet_ntoa(client_addr->sin_addr), udp_port,
+                     SENSOR_CATALOGUE[idx].interval_ms);
+    send_tcp(tcp_fd, resp, (size_t)n);
 }
 
 static void handle_stop(int tcp_fd, const char *resource)
 {
     int idx = parse_sensor_resource(resource);
     if (idx < 0) {
-        send_response(tcp_fd, STATUS_NOT_FOUND, "Not Found",
-                      "Unknown sensor.");
+        char detail[128];
+        snprintf(detail, sizeof(detail),
+                 "sensor '%s' nao existe", resource + 8);
+        send_error(tcp_fd, STATUS_NOT_FOUND, "Not Found", detail);
         server_log("STOP rejected: unknown resource '%s'", resource);
         return;
     }
 
     if (!sensors[idx].active) {
-        send_response(tcp_fd, STATUS_CONFLICT, "Conflict",
-                      "Sensor already inactive.");
+        char detail[128];
+        snprintf(detail, sizeof(detail),
+                 "sensor '%s' ja esta inativo", SENSOR_CATALOGUE[idx].name);
+        send_error(tcp_fd, STATUS_CONFLICT, "Conflict", detail);
         server_log("STOP rejected: '%s' already inactive",
                    SENSOR_CATALOGUE[idx].name);
         return;
     }
 
     sensors[idx].active = 0;
-    /* Give the thread time to notice and exit its loop */
     usleep(sensors[idx].udp_fd > 0 ?
            (unsigned)(SENSOR_CATALOGUE[idx].interval_ms * 1000 * 2) : 100000);
 
-    server_log("STOP '%s'", SENSOR_CATALOGUE[idx].name);
-
-    char body[128];
-    snprintf(body, sizeof(body), "Sensor '%s' stopped.",
-             SENSOR_CATALOGUE[idx].name);
-    send_response(tcp_fd, STATUS_OK, "OK", body);
+    char resp[BUF_SIZE];
+    int n = snprintf(resp, sizeof(resp),
+                     "200 OK" CRLF
+                     "Sensor: %s" CRLF
+                     "Status: stopped" CRLF
+                     CRLF,
+                     SENSOR_CATALOGUE[idx].name);
+    send_tcp(tcp_fd, resp, (size_t)n);
 }
 
 static void handle_status(int tcp_fd, const char *resource)
 {
-    /* STATUS /sensors — list all */
     if (strcmp(resource, "/sensors") == 0) {
-        char body[BUF_SIZE];
-        int  off = 0;
+        char resp[BUF_SIZE];
+        int off = snprintf(resp, sizeof(resp),
+                           "200 OK" CRLF
+                           "Count: %d" CRLF,
+                           NUM_SENSORS);
         for (int i = 0; i < NUM_SENSORS; i++) {
-            off += snprintf(body + off, sizeof(body) - (size_t)off,
-                            "%s: %s (seq %u)\n",
-                            SENSOR_CATALOGUE[i].name,
-                            sensors[i].active ? "active" : "inactive",
-                            sensors[i].seq);
+            if (sensors[i].active) {
+                off += snprintf(resp + off, sizeof(resp) - (size_t)off,
+                                "%s: streaming (seq=%u)" CRLF,
+                                SENSOR_CATALOGUE[i].name, sensors[i].seq);
+            } else {
+                off += snprintf(resp + off, sizeof(resp) - (size_t)off,
+                                "%s: inactive" CRLF,
+                                SENSOR_CATALOGUE[i].name);
+            }
         }
-        send_response(tcp_fd, STATUS_OK, "OK", body);
-        server_log("STATUS /sensors");
+        off += snprintf(resp + off, sizeof(resp) - (size_t)off, CRLF);
+        send_tcp(tcp_fd, resp, (size_t)off);
         return;
     }
 
-    /* STATUS /sensor/<tipo> — single sensor */
     int idx = parse_sensor_resource(resource);
     if (idx < 0) {
-        send_response(tcp_fd, STATUS_NOT_FOUND, "Not Found",
-                      "Unknown sensor.");
+        char detail[128];
+        snprintf(detail, sizeof(detail),
+                 "sensor '%s' nao existe", resource + 8);
+        send_error(tcp_fd, STATUS_NOT_FOUND, "Not Found", detail);
         server_log("STATUS rejected: unknown resource '%s'", resource);
         return;
     }
 
-    char body[256];
-    snprintf(body, sizeof(body),
-             "%s: %s (seq %u, last value %.2f %s)\n",
-             SENSOR_CATALOGUE[idx].name,
-             sensors[idx].active ? "active" : "inactive",
-             sensors[idx].seq,
-             sensors[idx].current_value,
-             SENSOR_CATALOGUE[idx].unit);
-    send_response(tcp_fd, STATUS_OK, "OK", body);
-    server_log("STATUS /sensor/%s", SENSOR_CATALOGUE[idx].name);
+    char resp[BUF_SIZE];
+    int n;
+    if (sensors[idx].active) {
+        n = snprintf(resp, sizeof(resp),
+                     "200 OK" CRLF
+                     "Sensor: %s" CRLF
+                     "Status: streaming" CRLF
+                     "Seq: %u" CRLF
+                     "Value: %.2f %s" CRLF
+                     CRLF,
+                     SENSOR_CATALOGUE[idx].name,
+                     sensors[idx].seq,
+                     sensors[idx].current_value,
+                     SENSOR_CATALOGUE[idx].unit);
+    } else {
+        n = snprintf(resp, sizeof(resp),
+                     "200 OK" CRLF
+                     "Sensor: %s" CRLF
+                     "Status: inactive" CRLF
+                     CRLF,
+                     SENSOR_CATALOGUE[idx].name);
+    }
+    send_tcp(tcp_fd, resp, (size_t)n);
 }
 
 static void handle_exit(int tcp_fd)
 {
-    /* Stop every active sensor before replying */
     for (int i = 0; i < NUM_SENSORS; i++) {
         if (sensors[i].active) {
             sensors[i].active = 0;
         }
     }
-    /* Brief pause to let threads finish their current iteration */
     usleep(600000);
 
-    send_response(tcp_fd, STATUS_OK, "OK", "Server shutting down.");
-    server_log("EXIT received — shutting down");
+    char resp[] = "200 OK" CRLF CRLF;
+    send_tcp(tcp_fd, resp, strlen(resp));
+    server_log("EXIT recebido — encerrando");
 }
 
 /* ------------------------------------------------------------------ */
@@ -398,15 +412,14 @@ static void dispatch_request(int tcp_fd, const char *msg,
     char method[16]   = {0};
     char resource[128] = {0};
 
-    /* Extract the request line */
     if (sscanf(msg, "%15s %127s", method, resource) < 2) {
-        send_response(tcp_fd, STATUS_BAD_REQUEST, "Bad Request",
-                      "Malformed request line.");
+        send_error(tcp_fd, STATUS_BAD_REQUEST, "Bad Request",
+                   "requisicao mal formatada");
         server_log("Bad request: could not parse method/resource");
         return;
     }
 
-    server_log("Received: %s %s", method, resource);
+    server_log("Comando: %s %s", method, resource);
 
     if (strcmp(method, "START") == 0) {
         handle_start(tcp_fd, resource, msg, client_addr, udp_fd);
@@ -418,8 +431,8 @@ static void dispatch_request(int tcp_fd, const char *msg,
         handle_exit(tcp_fd);
         *running = 0;
     } else {
-        send_response(tcp_fd, STATUS_BAD_REQUEST, "Bad Request",
-                      "Unknown method.");
+        send_error(tcp_fd, STATUS_BAD_REQUEST, "Bad Request",
+                   "metodo desconhecido");
         server_log("Unknown method '%s'", method);
     }
 }
@@ -466,7 +479,7 @@ int main(int argc, char *argv[])
         perror("listen"); close(listen_fd); exit(EXIT_FAILURE);
     }
 
-    server_log("Listening on TCP port %d", tcp_port);
+    server_log("Servidor TCP escutando na porta %d...", tcp_port);
 
     /* ---- Create UDP socket for sending sensor data ---- */
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -477,7 +490,7 @@ int main(int argc, char *argv[])
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
 
-        server_log("Waiting for client connection...");
+        server_log("Aguardando conexao de cliente...");
         int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr,
                                &addr_len);
         if (client_fd < 0) {
@@ -485,7 +498,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        server_log("Client connected from %s:%d",
+        server_log("Cliente conectado: %s:%d",
                    inet_ntoa(client_addr.sin_addr),
                    ntohs(client_addr.sin_port));
 
@@ -504,7 +517,7 @@ int main(int argc, char *argv[])
                              sizeof(recv_buf) - (size_t)buf_len - 1, 0);
             if (n <= 0) {
                 if (n == 0)
-                    server_log("Client disconnected");
+                    server_log("Cliente desconectado");
                 else
                     perror("recv");
                 break;
@@ -536,9 +549,8 @@ int main(int argc, char *argv[])
                 recv_buf[buf_len] = '\0';
             }
 
-            /* Guard against buffer overflow from a client that never terminates */
             if (buf_len >= (int)(sizeof(recv_buf) - 1)) {
-                server_log("Receive buffer overflow — clearing");
+                server_log("Buffer overflow — limpando");
                 buf_len = 0;
             }
         }
@@ -552,7 +564,7 @@ int main(int argc, char *argv[])
         usleep(600000);
 
         close(client_fd);
-        server_log("Client session ended");
+        server_log("Sessao do cliente encerrada");
 
         /* Reset sequence counters for the next session */
         for (int i = 0; i < NUM_SENSORS; i++) {
@@ -565,6 +577,6 @@ int main(int argc, char *argv[])
 
     close(udp_fd);
     close(listen_fd);
-    server_log("Server terminated.");
+    server_log("Servidor encerrado.");
     return 0;
 }

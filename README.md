@@ -77,6 +77,7 @@ Ao iniciar o cliente, um prompt interativo fica disponível. Os comandos aceitos
 
 Inicia o streaming de um sensor. Os sensores disponíveis são `temperatura`, `umidade`
 e `pressao`. A porta UDP é opcional e usa o valor padrão se não informada.
+Também aceita o formato do protocolo: `START /sensor/temperatura`.
 
     stop <sensor>
 
@@ -93,7 +94,7 @@ Consulta o estado de um sensor específico.
     stats
 
 Comando local que exibe as estatísticas acumuladas de cada sensor que já enviou dados:
-pacotes recebidos, pacotes perdidos, valor mínimo, máximo e médio.
+pacotes recebidos, pacotes perdidos (com percentual), valor mínimo, máximo e médio.
 
     quit
 
@@ -108,60 +109,47 @@ Exibe a lista de comandos disponíveis.
 
 ```
 $ ./sensor_server
-[14:30:01] Listening on TCP port 9000
-[14:30:01] Waiting for client connection...
+[14:30:01] Servidor TCP escutando na porta 9000...
+[14:30:01] Aguardando conexao de cliente...
 ```
 
 Em outro terminal:
 
 ```
 $ ./sensor_client
-Connected to server 127.0.0.1:9000 (TCP)
-Listening for sensor data on UDP port 9001
-Type 'help' for available commands.
+Conectado ao servidor 127.0.0.1:9000
+Socket UDP escutando na porta 9001
+Digite comandos (START, STOP, STATUS, stats, quit):
 
 start temperatura
---- Server Response ---
-200 OK
-Content-Length: 28
-
-Sensor 'temperatura' started.
----
-
-[UDP] SEQ:1   temperatura   27.50 C  (ts 1712345678.123)
-[UDP] SEQ:2   temperatura   27.43 C  (ts 1712345678.223)
-[UDP] SEQ:3   temperatura   27.55 C  (ts 1712345678.323)
+Resposta: 200 OK | Sensor: temperatura | Status: streaming | UdpTarget: 127.0.0.1:9001 | Interval: 100ms
+[UDP] SEQ:1    | temperatura  | 27.58 C   | TS:1775619504.798
+[UDP] SEQ:2    | temperatura  | 27.81 C   | TS:1775619504.902
+[UDP] SEQ:3    | temperatura  | 27.86 C   | TS:1775619505.003
 
 start umidade
---- Server Response ---
-200 OK
-Content-Length: 24
-
-Sensor 'umidade' started.
----
-
-[UDP] SEQ:1   umidade       60.12 %  (ts 1712345679.001)
-[UDP] SEQ:4   temperatura   27.61 C  (ts 1712345678.423)
+Resposta: 200 OK | Sensor: umidade | Status: streaming | UdpTarget: 127.0.0.1:9001 | Interval: 200ms
+[UDP] SEQ:1    | umidade      | 60.29 %   | TS:1775619505.449
+[UDP] SEQ:8    | temperatura  | 27.76 C   | TS:1775619505.521
 
 stats
-===== Sensor Statistics =====
-  [temperatura]
-    Received : 4
-    Lost     : 0
-    Min      : 27.43
-    Max      : 27.61
-    Average  : 27.52
-  [umidade]
-    Received : 1
-    Lost     : 0
-    Min      : 60.12
-    Max      : 60.12
-    Average  : 60.12
-=============================
+=== Estatisticas Locais ===
+temperatura  recebidos=8, perdidos=0 (0.0%), min=27.58, max=27.97, media=27.78
+umidade      recebidos=1, perdidos=0 (0.0%), min=60.29, max=60.29, media=60.29
+
+status
+Resposta: 200 OK | Count: 3
+  temperatura: streaming (seq=42)
+  umidade: streaming (seq=12)
+  pressao: inactive
 
 stop temperatura
+Resposta: 200 OK | Sensor: temperatura | Status: stopped
 stop umidade
+Resposta: 200 OK | Sensor: umidade | Status: stopped
 quit
+Enviando EXIT ao servidor...
+Conexao encerrada.
 ```
 
 
@@ -182,5 +170,6 @@ a entrada padrão (stdin), o socket TCP e o socket UDP. Isso evita a necessidade
 no lado do cliente.
 
 O protocolo de controle TCP usa mensagens de texto terminadas por `\r\n\r\n`, com uma linha
-de requisição seguida de headers opcionais. O protocolo de dados UDP usa datagramas de texto
-com campos separados por `|`.
+de requisição seguida de headers (pares chave-valor). As respostas seguem o mesmo padrão,
+com código de status, headers descritivos e corpo opcional. O protocolo de dados UDP usa
+datagramas de texto com campos separados por `|`.
